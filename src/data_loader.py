@@ -167,7 +167,7 @@ def generate_synthetic_gait_data(
                 interaction_effects[:, :, c]
             
             # トライアル変動
-            data[trial, :, :, c] += trial_variation.squeeze()
+            data[trial, :, :, c] += trial_variation[:, 0, 0][:, np.newaxis]
             
             # ノイズ
             data[trial, :, :, c] += noise_level * \
