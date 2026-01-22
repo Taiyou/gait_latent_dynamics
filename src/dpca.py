@@ -591,3 +591,224 @@ class GaitDPCA(DemixedPCA):
             separation_scores[key] = float(distance)
         
         return separation_scores
+
+
+class ContinuousScoreDPCA:
+    """
+    連続値メンタルスコア（wellbeing等）対応のdPCA拡張
+    
+    メンタル状態が時間に依存せず一定のスコア（例：wellbeingスコア）で
+    表される場合に使用します。
+    
+    Parameters
+    ----------
+    n_components : int, default=10
+        抽出する成分数
+    
+    Attributes
+    ----------
+    gait_components_ : ndarray
+        歩行パターンの主成分（時間依存）
+    score_weights_ : ndarray
+        メンタルスコアとの関連を表す重み
+    correlation_ : ndarray
+        各成分とメンタルスコアの相関
+    
+    Notes
+    -----
+    このクラスは以下のモデルを仮定します：
+    
+    歩行データ X(t) = 時間成分(t) + スコア依存成分 * wellbeing_score + 残差
+    
+    wellbeingスコアは各トライアル/条件で一定値を取り、
+    歩行周期内では変化しません。
+    """
+    
+    def __init__(self, n_components: int = 10):
+        self.n_components = n_components
+        self.gait_components_: Optional[np.ndarray] = None
+        self.score_weights_: Optional[np.ndarray] = None
+        self.correlation_: Optional[np.ndarray] = None
+        self.mean_: Optional[np.ndarray] = None
+        self._feature_names: List[str] = []
+    
+    def fit(
+        self,
+        X: np.ndarray,
+        scores: np.ndarray,
+        feature_labels: Optional[List[str]] = None
+    ) -> 'ContinuousScoreDPCA':
+        """
+        連続値スコアを用いてフィット
+        
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_features, n_timepoints)
+            歩行データ。n_samplesは各トライアル/被験者
+        scores : ndarray of shape (n_samples,)
+            各サンプルのメンタルスコア（wellbeing等）
+            時間に依存せず、各サンプルで一定値
+        feature_labels : list of str, optional
+            特徴量ラベル
+            
+        Returns
+        -------
+        self : ContinuousScoreDPCA
+        
+        Examples
+        --------
+        >>> # 30人の被験者、各15特徴量、100時間点
+        >>> X = np.random.randn(30, 15, 100)
+        >>> wellbeing_scores = np.random.rand(30) * 10  # 0-10のスコア
+        >>> model = ContinuousScoreDPCA(n_components=5)
+        >>> model.fit(X, wellbeing_scores)
+        """
+        n_samples, n_features, n_timepoints = X.shape
+        
+        if feature_labels is not None:
+            self._feature_names = feature_labels
+        else:
+            self._feature_names = [f'feature_{i}' for i in range(n_features)]
+        
+        # スコアを正規化
+        scores_normalized = (scores - scores.mean()) / (scores.std() + 1e-10)
+        
+        # 全体平均
+        self.mean_ = X.mean(axis=0)
+        X_centered = X - self.mean_
+        
+        # 時間方向に平均化して、スコア依存成分を抽出
+        # X_time_avg: (n_samples, n_features)
+        X_time_avg = X_centered.mean(axis=2)
+        
+        # スコアとの相関を計算
+        # 各特徴量とスコアの相関
+        correlations = np.array([
+            np.corrcoef(X_time_avg[:, f], scores_normalized)[0, 1]
+            for f in range(n_features)
+        ])
+        
+        # スコア依存成分を回帰で推定
+        # X_time_avg = beta * scores + residual
+        scores_design = scores_normalized[:, np.newaxis]
+        beta = np.linalg.lstsq(scores_design, X_time_avg, rcond=None)[0]
+        self.score_weights_ = beta.flatten()
+        
+        # 残差から時間依存成分をPCAで抽出
+        X_residual = X_centered - np.outer(scores_normalized, self.score_weights_)[:, :, np.newaxis]
+        
+        # 時間方向の共分散を計算
+        X_flat = X_residual.reshape(n_samples, -1)
+        cov = np.cov(X_flat.T)
+        
+        # PCAで時間依存成分を抽出
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        idx = np.argsort(eigenvalues)[::-1]
+        
+        n_comp = min(self.n_components, len(eigenvalues))
+        self.gait_components_ = eigenvectors[:, idx[:n_comp]]
+        self.explained_variance_ = eigenvalues[idx[:n_comp]]
+        
+        # 各成分とスコアの相関を計算
+        projections = X_flat @ self.gait_components_
+        self.correlation_ = np.array([
+            np.corrcoef(projections[:, i], scores_normalized)[0, 1]
+            for i in range(n_comp)
+        ])
+        
+        return self
+    
+    def transform(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        データを変換
+        
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_features, n_timepoints)
+            
+        Returns
+        -------
+        transformed : dict
+            'time': 時間依存成分への射影
+            'score_effect': スコア依存成分の推定値
+        """
+        n_samples = X.shape[0]
+        X_centered = X - self.mean_
+        X_flat = X_centered.reshape(n_samples, -1)
+        
+        return {
+            'time': X_flat @ self.gait_components_,
+            'score_effect': X_centered.mean(axis=2) @ self.score_weights_
+        }
+    
+    def predict_score(self, X: np.ndarray) -> np.ndarray:
+        """
+        歩行データからメンタルスコアを予測
+        
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_features, n_timepoints)
+            
+        Returns
+        -------
+        predicted_scores : ndarray of shape (n_samples,)
+            予測されたメンタルスコア
+        """
+        X_centered = X - self.mean_
+        X_time_avg = X_centered.mean(axis=2)
+        
+        # 重みを使って予測
+        weight_norm = np.linalg.norm(self.score_weights_)
+        if weight_norm > 0:
+            predicted = X_time_avg @ self.score_weights_ / (weight_norm ** 2)
+        else:
+            predicted = np.zeros(X.shape[0])
+        
+        return predicted
+    
+    def get_score_related_features(self, threshold: float = 0.3) -> List[str]:
+        """
+        メンタルスコアと強く関連する特徴量を取得
+        
+        Parameters
+        ----------
+        threshold : float
+            相関の閾値（絶対値）
+            
+        Returns
+        -------
+        features : list of str
+            関連する特徴量のリスト
+        """
+        # 各特徴量の重みの絶対値でソート
+        weights_abs = np.abs(self.score_weights_)
+        weights_normalized = weights_abs / (weights_abs.max() + 1e-10)
+        
+        related = [
+            self._feature_names[i]
+            for i in range(len(self._feature_names))
+            if weights_normalized[i] > threshold
+        ]
+        
+        return related
+    
+    def summary(self) -> Dict:
+        """
+        分析結果のサマリーを取得
+        
+        Returns
+        -------
+        summary : dict
+            分析結果のサマリー
+        """
+        weights_abs = np.abs(self.score_weights_)
+        top_indices = np.argsort(weights_abs)[::-1][:5]
+        
+        return {
+            'top_score_related_features': [
+                (self._feature_names[i], float(self.score_weights_[i]))
+                for i in top_indices
+            ],
+            'explained_variance_time': float(self.explained_variance_.sum()),
+            'n_components': self.n_components
+        }
