@@ -1183,3 +1183,416 @@ class MultiVariateMentalDPCA:
             'canonical_correlations': self.correlations_.tolist() if self.correlations_ is not None else [],
             'mental_gait_associations': self.get_mental_gait_associations()
         }
+
+
+class DemixedPLS(BaseEstimator, TransformerMixin):
+    """
+    Demixed Partial Least Squares (dPLS)
+    
+    Supervised version of dPCA that finds components maximizing covariance
+    with target variables (mental scores) for each marginalization.
+    
+    Key Differences from dPCA:
+    -------------------------
+    | Aspect          | dPCA                    | dPLS                      |
+    |-----------------|-------------------------|---------------------------|
+    | Objective       | Maximize variance       | Maximize covariance with Y|
+    | Supervision     | Unsupervised            | Supervised                |
+    | Use case        | Exploratory analysis    | Prediction/Association    |
+    | Output          | Variance-explaining PCs | Target-predictive PCs     |
+    
+    Data Structure:
+    - X: [n_features, n_timepoints, n_conditions] - Gait data (like dPCA)
+    - Y: [n_conditions] or [n_conditions, n_targets] - Mental scores per condition
+    
+    Parameters
+    ----------
+    n_components : int, default=5
+        Number of components per marginalization
+    regularizer : float or 'auto', default='auto'
+        Regularization parameter
+    scale_y : bool, default=True
+        Whether to scale target variables
+    
+    Attributes
+    ----------
+    components_ : dict
+        Demixed PLS components for each marginalization
+    x_weights_ : dict
+        X weights for each marginalization
+    y_weights_ : dict
+        Y weights for each marginalization
+    covariance_explained_ : dict
+        Covariance explained by each component
+    
+    Examples
+    --------
+    >>> # Gait data: [15 features, 100 timepoints, 5 conditions]
+    >>> X = np.random.randn(15, 100, 5)
+    >>> 
+    >>> # Mental scores per condition: [5 conditions]
+    >>> # e.g., mean wellbeing for each mental state condition
+    >>> Y = np.array([5.0, 3.0, 7.0, 6.0, 4.0])  # neutral, anxious, relaxed, focused, fatigued
+    >>> 
+    >>> dpls = DemixedPLS(n_components=3)
+    >>> dpls.fit(X, Y)
+    >>> 
+    >>> # Get components that predict mental state
+    >>> Z = dpls.transform(X, marginalization='condition')
+    """
+    
+    def __init__(
+        self,
+        n_components: int = 5,
+        regularizer: Union[float, str] = 'auto',
+        scale_y: bool = True
+    ):
+        self.n_components = n_components
+        self.regularizer = regularizer
+        self.scale_y = scale_y
+        
+        # Fitted attributes
+        self.components_: Dict[str, np.ndarray] = {}
+        self.x_weights_: Dict[str, np.ndarray] = {}
+        self.y_weights_: Dict[str, np.ndarray] = {}
+        self.covariance_explained_: Dict[str, np.ndarray] = {}
+        self.mean_: Optional[np.ndarray] = None
+        self.y_mean_: Optional[np.ndarray] = None
+        self.y_std_: Optional[np.ndarray] = None
+        self.marginalized_means_: Dict[str, np.ndarray] = {}
+        self._feature_names: List[str] = []
+        self._condition_names: List[str] = []
+        self._regularizer_value: float = 1e-6
+        
+    def fit(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray,
+        feature_labels: Optional[List[str]] = None,
+        condition_labels: Optional[List[str]] = None,
+        marginalization_labels: Optional[List[str]] = None
+    ) -> 'DemixedPLS':
+        """
+        Fit Demixed PLS model.
+        
+        Parameters
+        ----------
+        X : ndarray of shape (n_features, n_timepoints, n_conditions)
+            Gait data organized by conditions
+        Y : ndarray of shape (n_conditions,) or (n_conditions, n_targets)
+            Mental scores for each condition
+        feature_labels : list of str, optional
+            Names of gait features
+        condition_labels : list of str, optional
+            Names of conditions (mental states)
+        marginalization_labels : list of str, optional
+            Labels for marginalizations (default: time, condition, interaction)
+            
+        Returns
+        -------
+        self : DemixedPLS
+        """
+        # Validate input
+        if X.ndim != 3:
+            raise ValueError(f"X must be 3D [n_features, n_timepoints, n_conditions], got {X.ndim}D")
+        
+        n_features, n_timepoints, n_conditions = X.shape
+        
+        # Handle Y shape
+        Y = np.atleast_1d(Y)
+        if Y.ndim == 1:
+            Y = Y.reshape(-1, 1)
+        
+        if Y.shape[0] != n_conditions:
+            raise ValueError(f"Y must have {n_conditions} rows (one per condition), got {Y.shape[0]}")
+        
+        # Store labels
+        self._feature_names = feature_labels or [f'feature_{i}' for i in range(n_features)]
+        self._condition_names = condition_labels or [f'condition_{i}' for i in range(n_conditions)]
+        
+        marg_labels = marginalization_labels or ['time', 'condition', 'interaction']
+        
+        # Center and scale Y
+        self.y_mean_ = Y.mean(axis=0)
+        self.y_std_ = Y.std(axis=0) + 1e-10
+        if self.scale_y:
+            Y_centered = (Y - self.y_mean_) / self.y_std_
+        else:
+            Y_centered = Y - self.y_mean_
+        
+        # Center X
+        self.mean_ = X.mean(axis=(1, 2))
+        X_centered = X - self.mean_[:, np.newaxis, np.newaxis]
+        
+        # Compute marginalized data
+        self._compute_marginalized_data(X_centered)
+        
+        # Determine regularizer
+        if self.regularizer == 'auto':
+            X_flat = X_centered.reshape(n_features, -1)
+            C = np.cov(X_flat)
+            self._regularizer_value = np.trace(C) / n_features * 1e-6
+        else:
+            self._regularizer_value = float(self.regularizer)
+        
+        # Fit dPLS for each marginalization
+        for marg_name in marg_labels:
+            self._fit_marginalization(X_centered, Y_centered, marg_name, n_features, n_timepoints, n_conditions)
+        
+        return self
+    
+    def _compute_marginalized_data(self, X: np.ndarray) -> None:
+        """Compute marginalized data for each source of variance."""
+        n_features, n_timepoints, n_conditions = X.shape
+        
+        mean_over_time = X.mean(axis=1, keepdims=True)
+        mean_over_condition = X.mean(axis=2, keepdims=True)
+        grand_mean = X.mean(axis=(1, 2), keepdims=True)
+        
+        # Time marginalization: what varies over time (same for all conditions)
+        self.marginalized_means_['time'] = mean_over_condition - grand_mean
+        
+        # Condition marginalization: what differs between conditions
+        self.marginalized_means_['condition'] = mean_over_time - grand_mean
+        
+        # Interaction: residual
+        self.marginalized_means_['interaction'] = X - mean_over_time - mean_over_condition + grand_mean
+    
+    def _fit_marginalization(
+        self, 
+        X: np.ndarray, 
+        Y: np.ndarray, 
+        marg_name: str,
+        n_features: int,
+        n_timepoints: int,
+        n_conditions: int
+    ) -> None:
+        """Fit dPLS for a specific marginalization using NIPALS algorithm."""
+        
+        if marg_name not in self.marginalized_means_:
+            warnings.warn(f"Unknown marginalization: {marg_name}, skipping")
+            return
+        
+        X_marg = self.marginalized_means_[marg_name]
+        
+        # For condition marginalization, we average over time to get [n_features, n_conditions]
+        # For time marginalization, we average over conditions to get [n_features, n_timepoints]
+        # For interaction, we flatten appropriately
+        
+        if marg_name == 'condition':
+            # Average over time: [n_features, n_conditions]
+            X_for_pls = X_marg.mean(axis=1)  # [n_features, n_conditions]
+            Y_for_pls = Y  # [n_conditions, n_targets]
+        elif marg_name == 'time':
+            # For time, Y doesn't vary over time, so we use the mean Y
+            # X: [n_features, n_timepoints] (averaged over conditions)
+            X_for_pls = X_marg.mean(axis=2).T  # [n_timepoints, n_features]
+            # Repeat Y for each timepoint or use PCA on time
+            Y_for_pls = np.tile(Y.mean(axis=0), (n_timepoints, 1))
+        else:  # interaction
+            # Flatten: [n_timepoints * n_conditions, n_features]
+            X_for_pls = X_marg.reshape(n_features, -1).T
+            # Repeat Y for each timepoint
+            Y_for_pls = np.tile(Y, (n_timepoints, 1))
+        
+        # Apply NIPALS PLS
+        n_comp = min(self.n_components, X_for_pls.shape[0], X_for_pls.shape[1], Y_for_pls.shape[1] * 3)
+        
+        X_weights, Y_weights, components, cov_explained = self._nipals_pls(
+            X_for_pls, Y_for_pls, n_comp
+        )
+        
+        self.x_weights_[marg_name] = X_weights
+        self.y_weights_[marg_name] = Y_weights
+        self.components_[marg_name] = components
+        self.covariance_explained_[marg_name] = cov_explained
+    
+    def _nipals_pls(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray,
+        n_components: int,
+        max_iter: int = 500,
+        tol: float = 1e-6
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """NIPALS algorithm for PLS."""
+        n_samples, n_features = X.shape
+        n_targets = Y.shape[1]
+        
+        X_weights = np.zeros((n_features, n_components))
+        Y_weights = np.zeros((n_targets, n_components))
+        T = np.zeros((n_samples, n_components))  # X scores
+        P = np.zeros((n_features, n_components))  # X loadings
+        cov_explained = np.zeros(n_components)
+        
+        X_residual = X.copy()
+        Y_residual = Y.copy()
+        
+        for k in range(n_components):
+            # Initialize u with first column of Y
+            u = Y_residual[:, 0:1] if Y_residual.shape[1] > 0 else np.random.randn(n_samples, 1)
+            
+            for _ in range(max_iter):
+                # X weight
+                w = X_residual.T @ u
+                w = w / (np.linalg.norm(w) + 1e-10)
+                
+                # X score
+                t = X_residual @ w
+                
+                # Y weight
+                c = Y_residual.T @ t
+                c = c / (np.linalg.norm(c) + 1e-10)
+                
+                # Y score
+                u_new = Y_residual @ c
+                
+                # Check convergence
+                if np.linalg.norm(u_new - u) < tol:
+                    break
+                u = u_new
+            
+            # X loading
+            p = X_residual.T @ t / (t.T @ t + 1e-10)
+            
+            # Store
+            X_weights[:, k] = w.flatten()
+            Y_weights[:, k] = c.flatten()
+            T[:, k] = t.flatten()
+            P[:, k] = p.flatten()
+            
+            # Covariance explained
+            cov_explained[k] = np.abs(t.T @ u).item()
+            
+            # Deflate
+            X_residual = X_residual - t @ p.T
+            Y_residual = Y_residual - t @ c.T
+        
+        return X_weights, Y_weights, P, cov_explained
+    
+    def transform(
+        self,
+        X: np.ndarray,
+        marginalization: Optional[str] = None
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        Transform data using fitted dPLS components.
+        
+        Parameters
+        ----------
+        X : ndarray of shape (n_features, n_timepoints, n_conditions)
+            Gait data
+        marginalization : str, optional
+            Which marginalization to use. If None, returns all.
+            
+        Returns
+        -------
+        transformed : ndarray or dict
+            Transformed data
+        """
+        n_features, n_timepoints, n_conditions = X.shape
+        X_centered = X - self.mean_[:, np.newaxis, np.newaxis]
+        
+        if marginalization is not None:
+            if marginalization not in self.components_:
+                raise ValueError(f"Unknown marginalization: {marginalization}")
+            
+            W = self.x_weights_[marginalization]
+            X_flat = X_centered.reshape(n_features, -1)
+            transformed = W.T @ X_flat
+            return transformed.reshape(-1, n_timepoints, n_conditions)
+        
+        # All marginalizations
+        result = {}
+        for marg_name, W in self.x_weights_.items():
+            X_flat = X_centered.reshape(n_features, -1)
+            proj = W.T @ X_flat
+            result[marg_name] = proj.reshape(-1, n_timepoints, n_conditions)
+        
+        return result
+    
+    def predict(
+        self,
+        X: np.ndarray,
+        marginalization: str = 'condition'
+    ) -> np.ndarray:
+        """
+        Predict mental scores from gait data.
+        
+        Parameters
+        ----------
+        X : ndarray of shape (n_features, n_timepoints, n_conditions)
+            Gait data
+        marginalization : str, default='condition'
+            Which marginalization to use for prediction
+            
+        Returns
+        -------
+        Y_pred : ndarray
+            Predicted mental scores
+        """
+        n_features, n_timepoints, n_conditions = X.shape
+        X_centered = X - self.mean_[:, np.newaxis, np.newaxis]
+        
+        # Average over time to get [n_features, n_conditions]
+        X_avg = X_centered.mean(axis=1)  # [n_features, n_conditions]
+        
+        W = self.x_weights_[marginalization]
+        P = self.components_[marginalization]
+        
+        # Project
+        T = W.T @ X_avg  # [n_components, n_conditions]
+        
+        # Reconstruct Y (simplified)
+        Y_weights = self.y_weights_[marginalization]
+        Y_pred = (T.T @ Y_weights.T)  # [n_conditions, n_targets]
+        
+        # Unscale
+        if self.scale_y:
+            Y_pred = Y_pred * self.y_std_ + self.y_mean_
+        else:
+            Y_pred = Y_pred + self.y_mean_
+        
+        return Y_pred.squeeze()
+    
+    def get_feature_importance(self, marginalization: str = 'condition') -> Dict[str, float]:
+        """
+        Get feature importance for predicting mental scores.
+        
+        Parameters
+        ----------
+        marginalization : str, default='condition'
+            Which marginalization to analyze
+            
+        Returns
+        -------
+        importance : dict
+            Feature name to importance score mapping
+        """
+        W = self.x_weights_[marginalization]
+        
+        # VIP-like score: weighted sum of squared weights
+        cov = self.covariance_explained_[marginalization]
+        vip = np.sqrt(W.shape[0] * np.sum(W**2 * cov, axis=1) / np.sum(cov))
+        
+        return {name: float(score) for name, score in zip(self._feature_names, vip)}
+    
+    def get_demixing_summary(self) -> Dict[str, float]:
+        """Get summary of covariance explained by each marginalization."""
+        total_cov = sum(cov.sum() for cov in self.covariance_explained_.values())
+        if total_cov == 0:
+            total_cov = 1
+        
+        return {
+            name: float(cov.sum() / total_cov)
+            for name, cov in self.covariance_explained_.items()
+        }
+    
+    def summary(self) -> Dict:
+        """Get analysis summary."""
+        return {
+            'n_components': self.n_components,
+            'marginalizations': list(self.components_.keys()),
+            'covariance_by_marginalization': self.get_demixing_summary(),
+            'top_features': self.get_feature_importance('condition') if 'condition' in self.x_weights_ else {}
+        }
