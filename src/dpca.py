@@ -1375,17 +1375,17 @@ class DemixedPLS(BaseEstimator, TransformerMixin):
         
         X_marg = self.marginalized_means_[marg_name]
         
-        # For condition marginalization, we average over time to get [n_features, n_conditions]
-        # For time marginalization, we average over conditions to get [n_features, n_timepoints]
+        # For condition marginalization, we average over time to get [n_conditions, n_features]
+        # For time marginalization, we average over conditions to get [n_timepoints, n_features]
         # For interaction, we flatten appropriately
         
         if marg_name == 'condition':
-            # Average over time: [n_features, n_conditions]
-            X_for_pls = X_marg.mean(axis=1)  # [n_features, n_conditions]
+            # Average over time: [n_features, n_conditions] -> transpose to [n_conditions, n_features]
+            X_for_pls = X_marg.mean(axis=1).T  # [n_conditions, n_features]
             Y_for_pls = Y  # [n_conditions, n_targets]
         elif marg_name == 'time':
             # For time, Y doesn't vary over time, so we use the mean Y
-            # X: [n_features, n_timepoints] (averaged over conditions)
+            # X: [n_features, n_timepoints] -> transpose to [n_timepoints, n_features]
             X_for_pls = X_marg.mean(axis=2).T  # [n_timepoints, n_features]
             # Repeat Y for each timepoint or use PCA on time
             Y_for_pls = np.tile(Y.mean(axis=0), (n_timepoints, 1))
