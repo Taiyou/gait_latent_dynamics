@@ -812,3 +812,374 @@ class ContinuousScoreDPCA:
             'explained_variance_time': float(self.explained_variance_.sum()),
             'n_components': self.n_components
         }
+
+
+class MultiVariateMentalDPCA:
+    """
+    Multi-variate Mental Score × Gait Dynamics Analysis
+    
+    Finds the relationship between multiple mental variables and gait latent dynamics.
+    
+    Data Structure:
+    - Mental scores: [n_subjects, n_mental_variables] - Time-invariant
+    - Gait dynamics: [n_subjects, n_timepoints, n_body_factors] - Time-varying
+    
+    This class extracts latent factors from gait that correspond to each mental variable.
+    
+    Parameters
+    ----------
+    n_gait_components : int, default=10
+        Number of latent gait components to extract
+    n_mental_components : int, default=None
+        Number of mental-gait associations to find (default: min of dimensions)
+    method : str, default='cca'
+        Method for finding associations: 'cca' (Canonical Correlation) or 'pls' (Partial Least Squares)
+    
+    Attributes
+    ----------
+    gait_latent_ : ndarray of shape (n_subjects, n_gait_components)
+        Latent gait representations (time-averaged + PCA)
+    mental_loadings_ : ndarray of shape (n_mental_variables, n_mental_components)
+        How mental variables load onto canonical/PLS components
+    gait_loadings_ : ndarray of shape (n_gait_components, n_mental_components)
+        How gait latent factors load onto canonical/PLS components
+    correlations_ : ndarray
+        Canonical correlations or explained variance
+    
+    Examples
+    --------
+    >>> # Mental scores: [30 subjects, 5 mental variables]
+    >>> mental_scores = np.random.randn(30, 5)  # wellbeing, anxiety, depression, stress, fatigue
+    >>> 
+    >>> # Gait data: [30 subjects, 100 timepoints, 15 body factors]
+    >>> gait_data = np.random.randn(30, 100, 15)
+    >>> 
+    >>> model = MultiVariateMentalDPCA(n_gait_components=10)
+    >>> model.fit(gait_data, mental_scores)
+    >>> 
+    >>> # Find which gait patterns relate to which mental variables
+    >>> associations = model.get_mental_gait_associations()
+    """
+    
+    def __init__(
+        self,
+        n_gait_components: int = 10,
+        n_mental_components: Optional[int] = None,
+        method: str = 'cca'
+    ):
+        self.n_gait_components = n_gait_components
+        self.n_mental_components = n_mental_components
+        self.method = method
+        
+        # Fitted attributes
+        self.gait_latent_: Optional[np.ndarray] = None
+        self.mental_loadings_: Optional[np.ndarray] = None
+        self.gait_loadings_: Optional[np.ndarray] = None
+        self.correlations_: Optional[np.ndarray] = None
+        self.gait_pca_components_: Optional[np.ndarray] = None
+        self.gait_mean_: Optional[np.ndarray] = None
+        self.mental_mean_: Optional[np.ndarray] = None
+        self.mental_std_: Optional[np.ndarray] = None
+        self._mental_labels: List[str] = []
+        self._gait_labels: List[str] = []
+        self._time_weights_: Optional[np.ndarray] = None
+        
+    def fit(
+        self,
+        gait_data: np.ndarray,
+        mental_scores: np.ndarray,
+        gait_labels: Optional[List[str]] = None,
+        mental_labels: Optional[List[str]] = None
+    ) -> 'MultiVariateMentalDPCA':
+        """
+        Fit the model to find mental-gait associations.
+        
+        Parameters
+        ----------
+        gait_data : ndarray of shape (n_subjects, n_timepoints, n_body_factors)
+            or (n_subjects, n_body_factors, n_timepoints)
+            Gait dynamics data
+        mental_scores : ndarray of shape (n_subjects, n_mental_variables)
+            Mental state scores (time-invariant, one value per subject per variable)
+        gait_labels : list of str, optional
+            Labels for gait body factors
+        mental_labels : list of str, optional
+            Labels for mental variables (e.g., ['wellbeing', 'anxiety', 'stress'])
+            
+        Returns
+        -------
+        self : MultiVariateMentalDPCA
+        """
+        # Validate and reshape gait data
+        # Expect: (n_subjects, n_timepoints, n_body_factors)
+        if gait_data.ndim != 3:
+            raise ValueError(
+                f"gait_data must be 3D, got {gait_data.ndim}D. "
+                "Expected shape: (n_subjects, n_timepoints, n_body_factors)"
+            )
+        
+        n_subjects, n_timepoints, n_body_factors = gait_data.shape
+        
+        # Validate mental scores
+        if mental_scores.ndim == 1:
+            mental_scores = mental_scores[:, np.newaxis]
+        
+        if mental_scores.shape[0] != n_subjects:
+            raise ValueError(
+                f"Number of subjects mismatch: gait_data has {n_subjects}, "
+                f"mental_scores has {mental_scores.shape[0]}"
+            )
+        
+        n_mental_vars = mental_scores.shape[1]
+        
+        # Set labels
+        if gait_labels is not None:
+            self._gait_labels = gait_labels
+        else:
+            self._gait_labels = [f'body_factor_{i}' for i in range(n_body_factors)]
+            
+        if mental_labels is not None:
+            self._mental_labels = mental_labels
+        else:
+            self._mental_labels = [f'mental_var_{i}' for i in range(n_mental_vars)]
+        
+        # Step 1: Extract time-averaged gait features + temporal dynamics
+        # Compute time-averaged gait (captures static posture differences)
+        self.gait_mean_ = gait_data.mean(axis=0)  # (n_timepoints, n_body_factors)
+        gait_centered = gait_data - self.gait_mean_
+        
+        # Time-average for each subject (removes time dimension)
+        gait_time_avg = gait_data.mean(axis=1)  # (n_subjects, n_body_factors)
+        
+        # Also extract temporal variance features
+        gait_time_std = gait_data.std(axis=1)  # (n_subjects, n_body_factors)
+        
+        # Combine static and dynamic features
+        gait_features = np.hstack([gait_time_avg, gait_time_std])  # (n_subjects, 2*n_body_factors)
+        
+        # Step 2: PCA on gait features to get latent gait components
+        gait_features_centered = gait_features - gait_features.mean(axis=0)
+        
+        # SVD for PCA
+        U, s, Vt = np.linalg.svd(gait_features_centered, full_matrices=False)
+        
+        n_comp = min(self.n_gait_components, len(s), n_subjects - 1)
+        self.gait_pca_components_ = Vt[:n_comp].T  # (2*n_body_factors, n_comp)
+        self.gait_latent_ = gait_features_centered @ self.gait_pca_components_  # (n_subjects, n_comp)
+        self._gait_explained_var = s[:n_comp] ** 2 / (n_subjects - 1)
+        
+        # Step 3: Normalize mental scores
+        self.mental_mean_ = mental_scores.mean(axis=0)
+        self.mental_std_ = mental_scores.std(axis=0) + 1e-10
+        mental_normalized = (mental_scores - self.mental_mean_) / self.mental_std_
+        
+        # Step 4: Find associations between gait latent and mental scores
+        n_mental_comp = self.n_mental_components
+        if n_mental_comp is None:
+            n_mental_comp = min(n_comp, n_mental_vars)
+        
+        if self.method == 'cca':
+            self._fit_cca(self.gait_latent_, mental_normalized, n_mental_comp)
+        elif self.method == 'pls':
+            self._fit_pls(self.gait_latent_, mental_normalized, n_mental_comp)
+        else:
+            raise ValueError(f"Unknown method: {self.method}. Use 'cca' or 'pls'.")
+        
+        # Step 5: Compute feature-wise correlations for interpretation
+        self._compute_feature_correlations(gait_time_avg, mental_scores)
+        
+        return self
+    
+    def _fit_cca(self, X: np.ndarray, Y: np.ndarray, n_components: int):
+        """Canonical Correlation Analysis"""
+        from scipy import linalg
+        
+        n = X.shape[0]
+        
+        # Center the data
+        X_c = X - X.mean(axis=0)
+        Y_c = Y - Y.mean(axis=0)
+        
+        # Covariance matrices
+        Cxx = X_c.T @ X_c / (n - 1) + 1e-8 * np.eye(X.shape[1])
+        Cyy = Y_c.T @ Y_c / (n - 1) + 1e-8 * np.eye(Y.shape[1])
+        Cxy = X_c.T @ Y_c / (n - 1)
+        
+        # Solve generalized eigenvalue problem
+        Cxx_inv_sqrt = linalg.sqrtm(linalg.inv(Cxx))
+        Cyy_inv_sqrt = linalg.sqrtm(linalg.inv(Cyy))
+        
+        # SVD of transformed cross-covariance
+        T = Cxx_inv_sqrt @ Cxy @ Cyy_inv_sqrt
+        U, s, Vt = np.linalg.svd(T, full_matrices=False)
+        
+        n_comp = min(n_components, len(s))
+        
+        # Canonical weights
+        self.gait_loadings_ = np.real(Cxx_inv_sqrt @ U[:, :n_comp])
+        self.mental_loadings_ = np.real(Cyy_inv_sqrt @ Vt[:n_comp].T)
+        self.correlations_ = s[:n_comp]
+    
+    def _fit_pls(self, X: np.ndarray, Y: np.ndarray, n_components: int):
+        """Partial Least Squares"""
+        from sklearn.cross_decomposition import PLSCanonical
+        
+        n_comp = min(n_components, X.shape[1], Y.shape[1])
+        
+        pls = PLSCanonical(n_components=n_comp)
+        pls.fit(X, Y)
+        
+        self.gait_loadings_ = pls.x_weights_
+        self.mental_loadings_ = pls.y_weights_
+        
+        # Compute correlations
+        X_scores = X @ self.gait_loadings_
+        Y_scores = Y @ self.mental_loadings_
+        self.correlations_ = np.array([
+            np.corrcoef(X_scores[:, i], Y_scores[:, i])[0, 1]
+            for i in range(n_comp)
+        ])
+    
+    def _compute_feature_correlations(self, gait_features: np.ndarray, mental_scores: np.ndarray):
+        """Compute direct correlations between gait features and mental scores"""
+        n_gait = gait_features.shape[1]
+        n_mental = mental_scores.shape[1]
+        
+        self.feature_correlations_ = np.zeros((n_gait, n_mental))
+        
+        for g in range(n_gait):
+            for m in range(n_mental):
+                self.feature_correlations_[g, m] = np.corrcoef(
+                    gait_features[:, g], mental_scores[:, m]
+                )[0, 1]
+    
+    def transform(self, gait_data: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Transform gait data to latent space and predict mental associations.
+        
+        Parameters
+        ----------
+        gait_data : ndarray of shape (n_subjects, n_timepoints, n_body_factors)
+        
+        Returns
+        -------
+        result : dict
+            'gait_latent': Latent gait representations
+            'mental_projection': Projected mental scores
+        """
+        n_subjects = gait_data.shape[0]
+        
+        # Extract features
+        gait_time_avg = gait_data.mean(axis=1)
+        gait_time_std = gait_data.std(axis=1)
+        gait_features = np.hstack([gait_time_avg, gait_time_std])
+        
+        # Project to latent space
+        gait_features_centered = gait_features - gait_features.mean(axis=0)
+        gait_latent = gait_features_centered @ self.gait_pca_components_
+        
+        # Project to canonical/PLS space
+        gait_canonical = gait_latent @ self.gait_loadings_
+        
+        return {
+            'gait_latent': gait_latent,
+            'canonical_scores': gait_canonical
+        }
+    
+    def predict_mental(self, gait_data: np.ndarray) -> np.ndarray:
+        """
+        Predict mental scores from gait data.
+        
+        Parameters
+        ----------
+        gait_data : ndarray of shape (n_subjects, n_timepoints, n_body_factors)
+        
+        Returns
+        -------
+        predicted : ndarray of shape (n_subjects, n_mental_variables)
+        """
+        transformed = self.transform(gait_data)
+        gait_canonical = transformed['canonical_scores']
+        
+        # Inverse transform through mental loadings
+        # This is an approximation
+        mental_loadings_pinv = np.linalg.pinv(self.mental_loadings_.T)
+        predicted_normalized = gait_canonical @ mental_loadings_pinv
+        
+        # Denormalize
+        predicted = predicted_normalized * self.mental_std_ + self.mental_mean_
+        
+        return predicted
+    
+    def get_mental_gait_associations(self) -> Dict[str, Dict[str, float]]:
+        """
+        Get the associations between mental variables and gait factors.
+        
+        Returns
+        -------
+        associations : dict
+            For each mental variable, the top associated gait features
+        """
+        associations = {}
+        
+        for m_idx, m_label in enumerate(self._mental_labels):
+            # Get correlations for this mental variable
+            corrs = self.feature_correlations_[:, m_idx]
+            
+            # Sort by absolute correlation
+            sorted_idx = np.argsort(np.abs(corrs))[::-1]
+            
+            associations[m_label] = {
+                self._gait_labels[i]: float(corrs[i])
+                for i in sorted_idx[:5]  # Top 5
+            }
+        
+        return associations
+    
+    def get_canonical_interpretation(self) -> List[Dict]:
+        """
+        Get interpretation of canonical/PLS components.
+        
+        Returns
+        -------
+        interpretations : list of dict
+            For each component, the mental and gait loadings
+        """
+        interpretations = []
+        
+        for comp_idx in range(len(self.correlations_)):
+            mental_loads = self.mental_loadings_[:, comp_idx]
+            gait_loads = self.gait_loadings_[:, comp_idx]
+            
+            # Top mental variables for this component
+            top_mental_idx = np.argsort(np.abs(mental_loads))[::-1][:3]
+            top_mental = [(self._mental_labels[i], float(mental_loads[i])) for i in top_mental_idx]
+            
+            interpretations.append({
+                'component': comp_idx + 1,
+                'correlation': float(self.correlations_[comp_idx]),
+                'top_mental_loadings': top_mental,
+                'gait_loadings_summary': {
+                    'max': float(gait_loads.max()),
+                    'min': float(gait_loads.min()),
+                    'mean_abs': float(np.abs(gait_loads).mean())
+                }
+            })
+        
+        return interpretations
+    
+    def summary(self) -> Dict:
+        """
+        Get analysis summary.
+        
+        Returns
+        -------
+        summary : dict
+        """
+        return {
+            'method': self.method,
+            'n_gait_components': self.gait_latent_.shape[1] if self.gait_latent_ is not None else 0,
+            'n_mental_variables': len(self._mental_labels),
+            'canonical_correlations': self.correlations_.tolist() if self.correlations_ is not None else [],
+            'mental_gait_associations': self.get_mental_gait_associations()
+        }
