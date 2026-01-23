@@ -226,9 +226,22 @@ python examples/demo_dpca_analysis.py
 jupyter notebook notebooks/gait_mental_analysis.ipynb
 ```
 
+## Documentation
+
+Detailed explanations of each method:
+
+| Method | Description | Documentation |
+|--------|-------------|---------------|
+| DemixedPCA | Separate variance by source | [docs/demixed_pca.md](docs/demixed_pca.md) |
+| DemixedPLS | Supervised prediction | [docs/demixed_pls.md](docs/demixed_pls.md) |
+| ContinuousScoreDPCA | Single mental score | [docs/continuous_score_dpca.md](docs/continuous_score_dpca.md) |
+| MultiVariateMentalDPCA | Multiple mental variables | [docs/multivariate_mental_dpca.md](docs/multivariate_mental_dpca.md) |
+
 ## References
 
 - Kobak, D., et al. (2016). Demixed principal component analysis of neural population data. eLife, 5, e10989.
+- Hotelling, H. (1936). Relations between two sets of variates. Biometrika.
+- Wold, H. (1985). Partial least squares. Encyclopedia of statistical sciences.
 
 ## License
 
