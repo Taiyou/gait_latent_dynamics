@@ -129,112 +129,192 @@ class DemixedPCA(BaseEstimator, TransformerMixin):
         
         return self
     
-    def _validate_and_reshape_data(self, X: np.ndarray) -> np.ndarray:
-        """データの形状を検証し、必要に応じてリシェイプ"""
+    def _validate_and_reshape_data(self, X: np.ndarray, check_finite: bool = True) -> np.ndarray:
+        """データの形状を検証し、必要に応じてリシェイプ
+
+        Parameters
+        ----------
+        X : ndarray
+            入力データ
+        check_finite : bool, default=True
+            NaN/Infをチェックするかどうか
+
+        Returns
+        -------
+        X : ndarray
+            検証済みの3Dデータ
+        """
         if X.ndim == 4:
             # (n_trials, n_features, n_timepoints, n_conditions)
             # → trial average to (n_features, n_timepoints, n_conditions)
-            return X.mean(axis=0)
+            X = X.mean(axis=0)
         elif X.ndim == 3:
-            return X
+            pass
         else:
             raise ValueError(
                 f"Expected 3D or 4D array, got {X.ndim}D array. "
                 "Shape should be (n_features, n_timepoints, n_conditions) or "
                 "(n_trials, n_features, n_timepoints, n_conditions)"
             )
+
+        # NaN/Infのチェック
+        if check_finite and not np.all(np.isfinite(X)):
+            raise ValueError(
+                "Input data contains NaN or Inf values. "
+                "Please clean your data before fitting. "
+                "You can use np.nan_to_num() or remove invalid samples."
+            )
+
+        return X
     
     def _compute_marginalized_means(self, X: np.ndarray) -> None:
         """
         各marginalization（周辺化）に対する平均を計算
-        
+
         Marginalizationの種類:
         - time: 時間方向に平均化（条件依存成分）
-        - condition: 条件方向に平均化（時間依存成分）  
+        - condition: 条件方向に平均化（時間依存成分）
         - interaction: 上記を引いた残差（相互作用成分）
+
+        Note: エッジケース（単一条件/時点）では、該当する成分は0になります
         """
         n_features, n_timepoints, n_conditions = X.shape
-        
+
         # 時間方向の平均（各条件での平均 → 条件依存成分）
         mean_over_time = X.mean(axis=1, keepdims=True)
-        
+
         # 条件方向の平均（各時点での平均 → 時間依存成分）
         mean_over_condition = X.mean(axis=2, keepdims=True)
-        
+
         # 全体平均
         grand_mean = X.mean(axis=(1, 2), keepdims=True)
-        
+
         # Marginalized components
         # time: 時間依存成分（条件を平均化）
         self.marginalized_means_['time'] = mean_over_condition - grand_mean
-        
+
         # condition: 条件依存成分（時間を平均化）= メンタル状態依存
         self.marginalized_means_['condition'] = mean_over_time - grand_mean
-        
+
         # interaction: 相互作用成分
         self.marginalized_means_['interaction'] = (
             X - mean_over_time - mean_over_condition + grand_mean
         )
+
+        # 単一条件/時点のエッジケース処理
+        if n_conditions == 1:
+            # 条件が1つしかない場合、condition成分は0
+            warnings.warn(
+                "Only 1 condition provided. Condition-dependent components will be zero."
+            )
+        if n_timepoints == 1:
+            # 時点が1つしかない場合、time成分は0
+            warnings.warn(
+                "Only 1 timepoint provided. Time-dependent components will be zero."
+            )
     
     def _find_optimal_regularizer(self, X: np.ndarray) -> float:
         """交差検証で最適な正則化パラメータを決定"""
         n_features = X.shape[0]
-        
+
+        # 単一特徴量の場合は正則化不要
+        if n_features == 1:
+            return 1e-10
+
         # 共分散行列を計算
         X_flat = X.reshape(n_features, -1)
         C = np.cov(X_flat)
-        
-        # 正則化の候補値
-        reg_values = np.logspace(-6, 0, 20) * np.trace(C) / n_features
-        
+
+        # 共分散行列がスカラーの場合（サンプル数が少ない場合に発生）
+        if np.isscalar(C) or C.ndim == 0:
+            return 1e-10
+
+        # 共分散行列が1x1の場合
+        if C.shape[0] == 1:
+            return 1e-10
+
+        # トレースの計算
+        trace_C = np.trace(C)
+        if trace_C <= 0 or not np.isfinite(trace_C):
+            return 1e-10
+
         # 簡易的な正則化選択（データの特異値に基づく）
         try:
             _, s, _ = np.linalg.svd(C, full_matrices=False)
             # 条件数が大きすぎる場合は正則化
             condition_number = s[0] / s[-1] if s[-1] > 0 else np.inf
-            
+
             if condition_number > 1e10:
                 # 適度な正則化
                 optimal_reg = np.median(s) * 0.01
             else:
                 optimal_reg = 1e-10
         except np.linalg.LinAlgError:
-            optimal_reg = 1e-6 * np.trace(C) / n_features
-            
+            optimal_reg = 1e-6 * trace_C / n_features
+
         return optimal_reg
     
     def _fit_dpca(self, X: np.ndarray) -> None:
         """dPCAのメイン計算"""
         n_features, n_timepoints, n_conditions = X.shape
-        
+
         # フラット化したデータの共分散行列
         X_flat = X.reshape(n_features, -1)
         C_total = np.cov(X_flat)
-        
+
+        # 共分散行列の形状を保証（スカラーの場合は2D配列に変換）
+        if np.isscalar(C_total) or C_total.ndim == 0:
+            C_total = np.array([[C_total]])
+        elif C_total.ndim == 1:
+            C_total = C_total.reshape(-1, 1)
+
         # 正則化
-        C_total_reg = C_total + self._regularizer_value * np.eye(n_features)
-        
+        C_total_reg = C_total + self._regularizer_value * np.eye(C_total.shape[0])
+
         # 各marginalizationに対してdPCAを実行
         for margin_name, X_margin in self.marginalized_means_.items():
             # Marginalized dataをフラット化
             X_margin_flat = X_margin.reshape(n_features, -1)
-            
+
             # Marginalized共分散行列
             C_margin = np.cov(X_margin_flat)
-            
+
+            # 共分散行列の形状を保証
+            if np.isscalar(C_margin) or C_margin.ndim == 0:
+                C_margin = np.array([[C_margin]])
+            elif C_margin.ndim == 1:
+                C_margin = C_margin.reshape(-1, 1)
+
+            # NaN/Infのチェックと処理
+            if not np.all(np.isfinite(C_margin)):
+                warnings.warn(
+                    f"Covariance matrix for {margin_name} contains NaN/Inf. "
+                    "Using zero matrix instead (no variance in this marginalization)."
+                )
+                C_margin = np.zeros_like(C_margin)
+
             # 一般化固有値問題を解く: C_margin * v = lambda * C_total * v
             # これにより、marginalized varianceを最大化する方向を見つける
             try:
                 eigenvalues, eigenvectors = linalg.eigh(
-                    C_margin, 
+                    C_margin,
                     C_total_reg
                 )
-            except np.linalg.LinAlgError:
+            except (np.linalg.LinAlgError, ValueError) as e:
                 warnings.warn(
-                    f"Eigenvalue decomposition failed for {margin_name}. "
+                    f"Eigenvalue decomposition failed for {margin_name}: {e}. "
                     "Using standard PCA instead."
                 )
-                eigenvalues, eigenvectors = linalg.eigh(C_margin)
+                try:
+                    eigenvalues, eigenvectors = linalg.eigh(C_margin)
+                except (np.linalg.LinAlgError, ValueError):
+                    # フォールバック: 単位行列を使用
+                    warnings.warn(
+                        f"Standard eigenvalue decomposition also failed for {margin_name}. "
+                        "Using identity components."
+                    )
+                    eigenvalues = np.ones(min(self.n_components, n_features))
+                    eigenvectors = np.eye(n_features)[:, :len(eigenvalues)]
             
             # 固有値の大きい順にソート
             idx = np.argsort(eigenvalues)[::-1]

@@ -114,42 +114,60 @@ class TestDemixedPCAEdgeCases:
     def test_single_condition(self):
         """Test with single condition (edge case)
 
-        Note: Currently the implementation doesn't handle single condition well
-        due to division by zero in covariance computation. This is a known limitation.
+        With single condition, the condition-dependent components will be zero,
+        but the model should still fit successfully.
         """
         dpca = DemixedPCA(n_components=3)
         data = np.random.randn(10, 50, 1)
 
-        # Currently raises ValueError due to NaN/Inf in covariance matrix
-        # This documents the current behavior - a future improvement could handle this case
-        with pytest.raises(ValueError):
+        # Should fit successfully with a warning
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             dpca.fit(data)
+
+            # Should have issued a warning about single condition
+            assert any("1 condition" in str(warning.message) for warning in w)
+
+        # Model should have all components
+        assert 'time' in dpca.components_
+        assert 'condition' in dpca.components_
+        assert 'interaction' in dpca.components_
 
     def test_single_timepoint(self):
         """Test with single timepoint (edge case)
 
-        Note: Currently the implementation doesn't handle single timepoint well
-        due to issues in covariance computation. This is a known limitation.
+        With single timepoint, the time-dependent components will be zero,
+        but the model should still fit successfully.
         """
         dpca = DemixedPCA(n_components=3)
         data = np.random.randn(10, 1, 4)
 
-        # Currently raises ValueError due to NaN/Inf in covariance matrix
-        with pytest.raises(ValueError):
+        # Should fit successfully with a warning
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             dpca.fit(data)
+
+            # Should have issued a warning about single timepoint
+            assert any("1 timepoint" in str(warning.message) for warning in w)
+
+        # Model should have all components
+        assert 'time' in dpca.components_
+        assert 'condition' in dpca.components_
 
     def test_single_feature(self):
         """Test with single feature
 
-        Note: Currently the implementation doesn't handle single feature well
-        due to scalar vs array issues in covariance computation.
+        With single feature, the model should still work but with limited components.
         """
         dpca = DemixedPCA(n_components=1)
         data = np.random.randn(1, 50, 4)
 
-        # Currently raises ValueError due to scalar covariance matrix
-        with pytest.raises(ValueError):
-            dpca.fit(data)
+        # Should fit successfully
+        dpca.fit(data)
+
+        # Model should have components (limited to 1)
+        assert 'time' in dpca.components_
+        assert dpca.mean_.shape == (1,)
 
     def test_explicit_regularizer_value(self):
         """Test with explicit regularizer value instead of 'auto'"""
@@ -162,16 +180,25 @@ class TestDemixedPCAEdgeCases:
     def test_data_with_nan_values(self):
         """Test behavior with NaN values in data
 
-        Note: The current implementation does not handle NaN values gracefully.
-        It raises a ValueError during eigenvalue decomposition.
-        A future improvement could add input validation or NaN handling.
+        The implementation now validates input data and raises a clear error message
+        when NaN or Inf values are detected.
         """
         dpca = DemixedPCA(n_components=3)
         data = np.random.randn(10, 50, 4)
         data[0, 0, 0] = np.nan
 
-        # Currently raises ValueError because scipy.linalg.eigh doesn't accept NaN
-        with pytest.raises(ValueError, match="array must not contain infs or NaNs"):
+        # Should raise ValueError with helpful message
+        with pytest.raises(ValueError, match="contains NaN or Inf"):
+            dpca.fit(data)
+
+    def test_data_with_inf_values(self):
+        """Test behavior with Inf values in data"""
+        dpca = DemixedPCA(n_components=3)
+        data = np.random.randn(10, 50, 4)
+        data[0, 0, 0] = np.inf
+
+        # Should raise ValueError with helpful message
+        with pytest.raises(ValueError, match="contains NaN or Inf"):
             dpca.fit(data)
 
     def test_highly_correlated_features(self):
