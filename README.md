@@ -1,69 +1,94 @@
-# Gait Latent Dynamics: Demixed PCA Analysis
+# Gait Latent Dynamics: Mental State Analysis
 
-歩行ダイナミクスとメンタル状態の対応関係を分析するためのDemixed PCA (dPCA) 実装
+Analyze the relationship between **gait dynamics** and **mental states** using dimensionality reduction techniques.
 
-## 概要
+## Overview
 
-このプロジェクトは、歩行運動データからメンタル状態（不安、リラックス、集中など）に関連する成分を分離・抽出するためのdemixed PCA手法を提供します。
+This project provides tools to find associations between gait patterns and mental variables (wellbeing, anxiety, stress, fatigue, etc.) at the subject level.
 
-### Demixed PCA とは？
+### Key Features
 
-標準的なPCAはデータの分散を最大化する方向を見つけますが、各成分が何を表しているかの解釈が困難です。dPCAは、データの分散を以下のような異なる「ソース」に分解します：
+- **MultiVariateMentalDPCA**: Find associations between multiple mental variables and gait features using CCA/PLS
+- **ContinuousScoreDPCA**: Analyze single continuous mental score vs gait patterns
+- **DemixedPCA**: Separate variance into time, condition, and interaction components
+- **DemixedPLS**: Supervised version that maximizes covariance with target variables
 
-- **時間成分 (Time)**: 歩行周期に沿った変動パターン
-- **条件成分 (Condition)**: メンタル状態による変動
-- **相互作用成分 (Interaction)**: 時間と条件の相互作用
-
-## インストール
+## Installation
 
 ```bash
-# リポジトリをクローン
-git clone <repository-url>
+# Clone repository
+git clone https://github.com/Taiyou/gait_latent_dynamics.git
 cd gait_latent_dynamics
 
-# 依存関係をインストール
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-## クイックスタート
+## Quick Start
+
+### Subject-Level Analysis (Recommended)
 
 ```python
-from src.dpca import DemixedPCA
-from src.data_loader import generate_synthetic_gait_data, GaitDataLoader
-from src.visualization import DPCAVisualizer
+from src.dpca import MultiVariateMentalDPCA
+import numpy as np
 
-# 1. データの生成（または読み込み）
-data, metadata = generate_synthetic_gait_data(
-    n_trials=50,
-    n_features=15,
-    n_timepoints=100,
-    n_conditions=5,
-    random_state=42
+# Data structure
+# gait_data: [n_subjects, n_timepoints, n_body_factors]
+# mental_scores: [n_subjects, n_mental_vars]
+
+gait_data = np.random.randn(50, 100, 15)  # 50 subjects, 100 timepoints, 15 body factors
+mental_scores = np.random.randn(50, 4)    # 50 subjects, 4 mental variables
+
+# Fit model
+model = MultiVariateMentalDPCA(n_gait_components=10, method='cca')
+model.fit(
+    gait_data, 
+    mental_scores,
+    gait_labels=['hip_flexion', 'knee_flexion', ...],
+    mental_labels=['wellbeing', 'anxiety', 'stress', 'fatigue']
 )
 
-# 2. 前処理
-loader = GaitDataLoader()
-data_processed = loader.preprocess(data, normalize=True)
-data_averaged = loader.get_trial_averaged_data(data_processed)
+# Get associations
+associations = model.get_mental_gait_associations()
 
-# 3. dPCAフィッティング
-dpca = DemixedPCA(n_components=10, regularizer='auto')
-dpca.fit(data_averaged, feature_labels=metadata['feature_labels'])
-
-# 4. 結果の分析
-summary = dpca.get_demixing_summary()
-print("Variance Decomposition:", summary)
-
-# 5. 可視化
-viz = DPCAVisualizer()
-viz.plot_comprehensive_summary(
-    dpca,
-    data_averaged,
-    metadata['mental_state_labels']
-)
+# Correlation heatmap
+correlations = model.feature_correlations_  # [n_body_factors, n_mental_vars]
 ```
 
-## プロジェクト構造
+### Single Mental Variable
+
+```python
+from src.dpca import ContinuousScoreDPCA
+
+# gait_data: [n_subjects, n_features, n_timepoints]
+# wellbeing_scores: [n_subjects]
+
+model = ContinuousScoreDPCA(n_components=5)
+model.fit(gait_data, wellbeing_scores)
+
+# Predict wellbeing from gait
+predicted = model.predict_score(new_gait_data)
+
+# Get feature importance
+summary = model.summary()
+```
+
+## Data Structure
+
+### Subject-Level Analysis
+
+| Data | Shape | Description |
+|------|-------|-------------|
+| Gait Dynamics | `[n_subjects, n_timepoints, n_body_factors]` | Time-varying gait patterns per subject |
+| Mental Scores | `[n_subjects, n_mental_vars]` | Time-invariant mental scores per subject |
+
+### Condition-Based Analysis (dPCA)
+
+| Data | Shape | Description |
+|------|-------|-------------|
+| Gait Data | `[n_features, n_timepoints, n_conditions]` | Trial-averaged gait by condition |
+
+## Project Structure
 
 ```
 gait_latent_dynamics/
@@ -71,158 +96,140 @@ gait_latent_dynamics/
 ├── requirements.txt
 ├── src/
 │   ├── __init__.py
-│   ├── dpca.py           # dPCAコア実装
-│   ├── data_loader.py    # データ読み込み/生成
-│   └── visualization.py  # 可視化ツール
+│   ├── dpca.py           # Core implementations
+│   ├── data_loader.py    # Data loading/generation
+│   └── visualization.py  # Visualization tools
 ├── examples/
 │   └── demo_dpca_analysis.py
 ├── notebooks/
-│   └── dpca_tutorial.ipynb
-└── outputs/              # 出力ファイル保存先
+│   ├── gait_mental_analysis.ipynb    # Subject-level analysis
+│   ├── demixed_pca_explained.ipynb   # dPCA theory
+│   └── dpca_tutorial.ipynb           # Tutorial
+├── tests/
+│   └── test_dpca.py      # Test suite
+└── outputs/
 ```
 
-## 主要なクラスと関数
+## Available Classes
+
+### `MultiVariateMentalDPCA`
+
+Find associations between multiple mental variables and gait latent dynamics.
+
+```python
+model = MultiVariateMentalDPCA(
+    n_gait_components=10,   # Latent gait components to extract
+    method='cca'            # 'cca' or 'pls'
+)
+
+model.fit(gait_data, mental_scores, gait_labels=..., mental_labels=...)
+
+# Get associations (threshold for significance)
+associations = model.get_mental_gait_associations(threshold=0.3)
+
+# Direct feature correlations
+model.feature_correlations_  # [n_body_factors, n_mental_vars]
+```
+
+### `ContinuousScoreDPCA`
+
+For single continuous mental score (e.g., wellbeing only).
+
+```python
+model = ContinuousScoreDPCA(n_components=5)
+model.fit(gait_data, scores, feature_labels=...)
+
+# Predict scores from gait
+predicted = model.predict_score(new_data)
+
+# Feature weights
+model.score_weights_  # [n_features]
+```
 
 ### `DemixedPCA`
 
-dPCAのメインクラス。
+Separate variance into time, condition, and interaction components.
 
 ```python
-dpca = DemixedPCA(
-    n_components=10,      # 各marginalizationの成分数
-    regularizer='auto',   # 正則化パラメータ（'auto'で自動決定）
-    n_splits=5            # 交差検証の分割数
-)
+dpca = DemixedPCA(n_components=10, regularizer='auto')
+dpca.fit(data, feature_labels=...)
 
-# フィット
-dpca.fit(X, feature_labels=['hip', 'knee', ...])
+# Transform
+Z = dpca.transform(data)  # All marginalizations
+Z_cond = dpca.transform(data, marginalization='condition')
 
-# 変換
-transformed = dpca.transform(X)  # 全marginalization
-time_comp = dpca.transform(X, marginalization='time')  # 特定のみ
-
-# 逆変換（再構成）
-reconstructed = dpca.inverse_transform(transformed)
-
-# サマリー
+# Variance decomposition
 summary = dpca.get_demixing_summary()
 ```
 
-### `GaitDPCA`
+### `DemixedPLS`
 
-歩行解析に特化した拡張クラス。
-
-```python
-gait_dpca = GaitDPCA(n_components=10)
-gait_dpca.fit_with_labels(
-    X,
-    mental_state_labels=['neutral', 'anxious', 'relaxed'],
-    feature_labels=['hip_flexion', 'knee_flexion', ...]
-)
-
-# メンタル状態間の分離度を分析
-separation = gait_dpca.analyze_mental_state_separation(X, mental_state_labels)
-```
-
-### `GaitDataLoader`
-
-データの読み込みと前処理。
+Supervised demixed analysis (maximizes covariance with Y).
 
 ```python
-loader = GaitDataLoader()
+dpls = DemixedPLS(n_components=5)
+dpls.fit(X, Y, feature_labels=..., condition_labels=...)
 
-# NumPyファイルから読み込み
-data, metadata = loader.load_from_numpy('gait_data.npz')
+# Predict mental scores
+Y_pred = dpls.predict(X_new)
 
-# CSVから読み込み
-data, metadata = loader.load_from_csv(
-    'gait_data.csv',
-    time_column='time',
-    condition_column='mental_state'
-)
-
-# 前処理
-data_processed = loader.preprocess(
-    data,
-    normalize=True,
-    filter_cutoff=0.8,
-    resample_points=100
-)
+# Feature importance
+importance = dpls.get_feature_importance('condition')
 ```
 
-### `DPCAVisualizer`
+## Gait Features
 
-結果の可視化。
+| Feature | Description |
+|---------|-------------|
+| hip_flexion | Hip joint flexion angle |
+| hip_abduction | Hip joint abduction angle |
+| knee_flexion | Knee joint flexion angle |
+| ankle_dorsiflexion | Ankle dorsiflexion angle |
+| pelvis_tilt | Pelvis anterior/posterior tilt |
+| pelvis_obliquity | Pelvis lateral tilt |
+| trunk_flexion | Trunk forward/backward lean |
+| trunk_rotation | Trunk rotation |
+| stride_length | Step length |
+| step_width | Lateral distance between feet |
+| cadence | Steps per minute |
+| grf_vertical | Vertical ground reaction force |
+| grf_anterior | Anterior-posterior GRF |
+| grf_lateral | Lateral GRF |
+| com_velocity | Center of mass velocity |
 
-```python
-viz = DPCAVisualizer()
+## Mental Variables
 
-# 説明分散比
-viz.plot_explained_variance(dpca)
+| Variable | Description |
+|----------|-------------|
+| wellbeing | Overall mental wellbeing (positive) |
+| anxiety | Anxiety level |
+| stress | Stress level |
+| fatigue | Fatigue/tiredness level |
 
-# 成分の時系列
-viz.plot_component_timecourse(dpca, X, marginalization='condition', components=[0, 1, 2])
-
-# メンタル状態の分離
-viz.plot_mental_state_separation(dpca, X, mental_state_labels)
-
-# 成分重み
-viz.plot_component_weights(dpca, marginalization='condition', component=0)
-
-# 包括的サマリー
-viz.plot_comprehensive_summary(dpca, X, mental_state_labels, feature_labels)
-```
-
-## データ形式
-
-入力データは以下の形状を期待します：
-
-- **4D**: `(n_trials, n_features, n_timepoints, n_conditions)` - トライアルレベルデータ
-- **3D**: `(n_features, n_timepoints, n_conditions)` - トライアル平均データ
-
-### 例：
-
-```python
-# 50トライアル、15特徴量、100時間点、5条件
-data.shape = (50, 15, 100, 5)
-
-# 特徴量: 関節角度、歩行パラメータ、地面反力など
-# 時間: 歩行周期 0-100%
-# 条件: メンタル状態（neutral, anxious, relaxed, focused, fatigued）
-```
-
-## 合成データ生成
-
-```python
-from src.data_loader import generate_synthetic_gait_data
-
-data, metadata = generate_synthetic_gait_data(
-    n_trials=50,
-    n_features=15,
-    n_timepoints=100,
-    n_conditions=5,
-    mental_state_effect_strength=0.3,  # メンタル状態の影響
-    time_effect_strength=0.5,          # 時間の影響
-    interaction_strength=0.15,         # 相互作用
-    noise_level=0.1,
-    random_state=42
-)
-```
-
-## デモの実行
+## Running Tests
 
 ```bash
-# コマンドラインから
-python examples/demo_dpca_analysis.py
+# Run all tests
+python -m pytest tests/test_dpca.py -v
 
-# Jupyterノートブック
-jupyter notebook notebooks/dpca_tutorial.ipynb
+# Quick test
+python tests/test_dpca.py
 ```
 
-## 参考文献
+## Running Demos
 
-- Kobak, D., Brendel, W., Constantinidis, C., Feierstein, C. E., Kepecs, A., Mainen, Z. F., ... & Machens, C. K. (2016). Demixed principal component analysis of neural population data. eLife, 5, e10989.
+```bash
+# Command line demo
+python examples/demo_dpca_analysis.py
 
-## ライセンス
+# Jupyter notebooks
+jupyter notebook notebooks/gait_mental_analysis.ipynb
+```
+
+## References
+
+- Kobak, D., et al. (2016). Demixed principal component analysis of neural population data. eLife, 5, e10989.
+
+## License
 
 MIT License
