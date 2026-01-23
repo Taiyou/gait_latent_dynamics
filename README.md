@@ -228,7 +228,17 @@ jupyter notebook notebooks/gait_mental_analysis.ipynb
 
 ## Documentation
 
-Detailed explanations of each method:
+### 📘 [Practical Guide: Gait Latent Dynamics](docs/gait_latent_dynamics_guide.md)
+
+Complete tutorial covering:
+- Gait data structure and features
+- Mental state variables
+- Analysis workflow (step-by-step)
+- Method selection guide
+- Code examples
+- Interpretation guidelines
+
+### Method Details
 
 | Method | Description | Documentation |
 |--------|-------------|---------------|

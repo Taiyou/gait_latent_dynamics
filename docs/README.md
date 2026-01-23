@@ -2,6 +2,18 @@
 
 Detailed explanations of each method in the Gait Latent Dynamics package.
 
+## 📘 Practical Guide
+
+**[Gait Latent Dynamics Guide](gait_latent_dynamics_guide.md)** - Complete tutorial for analyzing gait-mental relationships:
+- Gait data overview and features
+- Mental state variables
+- Step-by-step workflow
+- Method selection guide
+- Practical code examples
+- Interpretation guidelines
+
+---
+
 ## Methods Overview
 
 | Method | Use Case | Mental Variable Type |
